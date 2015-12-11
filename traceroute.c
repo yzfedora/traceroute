@@ -13,7 +13,6 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  *************************************************************************/
-#define _GNU_SOURCE		/* GNU version of strerror_r() expect use. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -415,7 +414,7 @@ static void print_dst_addr(struct traceroute *tr)
 	char *str = str_dst_addr((struct sockaddr *)&tr->addr, tr->addrlen);
 
 	printf("traceroute to %s, %d hops max, %ld bytes packets\n",
-					str, tr->ttl_max, PACKET_SZ);
+					str, tr->ttl_max, (long)PACKET_SZ);
 	free(str);
 }
 
