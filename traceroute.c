@@ -115,16 +115,27 @@ out:
  */
 static int traceroute_set_port_and_ttl_v4(struct traceroute *tr)
 {
+	int err = 0;
+	
 	((struct sockaddr_in *)&tr->addr)->sin_port = htons(++tr->dport);
-	return setsockopt(tr->sendsk, IPPROTO_IP, IP_TTL, &tr->ttl,
-			  sizeof(tr->ttl));
+
+	if ((err = setsockopt(tr->sendsk, IPPROTO_IP, IP_TTL, &tr->ttl,
+		       sizeof(tr->ttl))) == -1)
+		perror("setsockopt");
+
+	return err;
 }
 
 static int traceroute_set_port_and_ttl_v6(struct traceroute *tr)
 {
+	int err = 0;
+
 	((struct sockaddr_in6 *)&tr->addr)->sin6_port = htons(++tr->dport);	
-	return setsockopt(tr->sendsk, IPPROTO_IPV6, IPV6_HOPLIMIT, &tr->ttl,
-			  sizeof(tr->ttl));
+	if ((err = setsockopt(tr->sendsk, IPPROTO_IPV6, IPV6_UNICAST_HOPS,
+			      &tr->ttl, sizeof(tr->ttl))) == -1)
+		perror("setsockopt");
+
+	return err;
 }
 
 static int traceroute_send(struct traceroute *tr)
@@ -419,9 +430,9 @@ static void print_dst_addr2(struct traceroute *tr)
 
 
 /*
- * Send 3 probe to the destination host, if the probe reach the host, 1 will be
- * returned. otherwise, 0 be returned. (also, the address of probe reached and
- * the rtt/2 will be printed too)
+ * Send 3 probes to the destination host, if the probes reachs the host or any
+ * error is happened, 1 will be returned. otherwise, return 0. (also, the
+ * address of probe reached and the rtt/2 will be printed too)
  */
 static int probe_launch(struct traceroute *tr)
 {
@@ -431,7 +442,8 @@ static int probe_launch(struct traceroute *tr)
 	int done = 0;
 
 	for ( ; i < nprobe; i++) {
-		tr->send(tr);
+		if (tr->send(tr) == -1)
+			done = 1;
 
 		/*
 		 * 'tr->ret' will indicates the errors, but just ignore.
