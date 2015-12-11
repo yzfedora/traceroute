@@ -109,38 +109,29 @@ out:
 	return sk;
 }
 
-static inline int set_ttl(int sk, int ttl)
+/*
+ * Dynamically increment the port of destination host. prevention the port
+ * of destination has been used.
+ */
+static int traceroute_set_port_and_ttl_v4(struct traceroute *tr)
 {
-	return setsockopt(sk, IPPROTO_IP, IP_TTL, &ttl, sizeof(ttl));
+	((struct sockaddr_in *)&tr->addr)->sin_port = htons(++tr->dport);
+	return setsockopt(tr->sendsk, IPPROTO_IP, IP_TTL, &tr->ttl,
+			  sizeof(tr->ttl));
 }
 
-static int set_port(struct sockaddr *sa, unsigned short port)
+static int traceroute_set_port_and_ttl_v6(struct traceroute *tr)
 {
-	switch (sa->sa_family) {
-	case AF_INET:
-		((struct sockaddr_in *)sa)->sin_port = htons(port);
-		break;
-	case AF_INET6:
-		((struct sockaddr_in6 *)sa)->sin6_port = htons(port);
-		break;
-	default:
-		return -1;
-	}
-
-	return 0;
+	((struct sockaddr_in6 *)&tr->addr)->sin6_port = htons(++tr->dport);	
+	return setsockopt(tr->sendsk, IPPROTO_IPV6, IPV6_HOPLIMIT, &tr->ttl,
+			  sizeof(tr->ttl));
 }
 
 static int traceroute_send(struct traceroute *tr)
 {
 	tr->ret = -1;
 
-	if (set_ttl(tr->sendsk, tr->ttl) == -1)
-		goto out;
-	/* 
-	 * tr->dport++, and set the port in the structure tr->addr.
-	 */
-	tr->dport++;
-	if (set_port((struct sockaddr *)&tr->addr, tr->dport) == -1)
+	if (tr->set_port_and_ttl(tr) == -1)
 		goto out;
 
 	/* Save the current time, that data be send. */
@@ -315,7 +306,7 @@ static int traceroute_validity_check_v6(struct traceroute *tr)
 	struct ipv6hdr *ipv6 = (struct ipv6hdr *)(tr->buf + 8);
 
 	if ((len -= sizeof(*ipv6)) < 8)
-		goto out;	/* 64-bits data from the upper layer. */
+		goto out;	/* first 64-bits data from the upper layer. */
 	struct udphdr *udp = (struct udphdr *)(tr->buf + 8 + (sizeof(*ipv6)));
 	
 	if ((ipv6->nexthdr != IPPROTO_UDP) ||
@@ -599,12 +590,15 @@ struct traceroute *traceroute_new(const char *hostname, int ttl_max)
 	if (traceroute_new_impl(tr) == -1)
 		goto out;
 
-	if (tr->addr.ss_family == AF_INET)
+	if (tr->addr.ss_family == AF_INET) {
 		tr->validity_check = traceroute_validity_check_v4;
-	else if (tr->addr.ss_family == AF_INET6)
+		tr->set_port_and_ttl = traceroute_set_port_and_ttl_v4;
+	} else if (tr->addr.ss_family == AF_INET6) {
 		tr->validity_check = traceroute_validity_check_v6;
-	else
+		tr->set_port_and_ttl = traceroute_set_port_and_ttl_v6;
+	} else {
 		goto out;
+	}
 
 	return tr;
 out:

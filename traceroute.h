@@ -44,6 +44,7 @@ struct traceroute {
 
 	long (*getrtt)(struct traceroute *tr);
 	int (*validity_check)(struct traceroute *tr);
+	int (*set_port_and_ttl)(struct traceroute *tr);
 	int (*send)(struct traceroute *tr);
 	int (*recv)(struct traceroute *tr);
 	void (*launch)(struct traceroute *tr);
