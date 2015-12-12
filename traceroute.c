@@ -120,7 +120,7 @@ static int set_nonblock(int fd)
 	}
 
 	flags |= O_NONBLOCK;
-	if (fcntl(fd, F_SETFL, &flags) == -1) {
+	if (fcntl(fd, F_SETFL, flags) == -1) {
 		perror("fcntl - F_SETFL");
 		return -1;
 	}
