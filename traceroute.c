@@ -16,11 +16,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <signal.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>		/* gettimeofday()		*/
 #include <netdb.h>
-#include <signal.h>
 #include <netinet/ip_icmp.h>	/* 'ICMP_*'			*/
 #include <linux/udp.h>		/* 'struct udphdr'		*/
 #include <linux/icmpv6.h>	/* 'ICMPV6_*'			*/
@@ -29,7 +30,26 @@
 #include <errno.h>
 #include "traceroute.h"
 
-static int gotalrm;		/* timedout when wait for response */
+
+#define INIT	__attribute__((constructor))
+
+/*
+ * We can't using SIG_IGN to ignore the SIGALRM simply. so we register a
+ * signal handelr for SIGALRM, but no anything acutally will be did.
+ */
+static void sigalrm_handler(int signo) { }
+
+static void INIT sigalrm_register(void)
+{
+	struct sigaction act;
+
+	memset(&act, 0, sizeof(act));
+	act.sa_handler = sigalrm_handler;
+	if (sigaction(SIGALRM, &act, NULL) == -1) {
+		perror("couldn't ignore the alarm signal");
+		exit(EXIT_FAILURE);
+	}
+}
 
 static void usage(char *progname)
 {
@@ -90,6 +110,28 @@ static int bind_by_port(int sk, int family, int sport)
 	return bind(sk, (struct sockaddr *)&ss, len);
 }
 
+static int set_nonblock(int fd)
+{
+	int flags;
+
+	if ((flags = fcntl(fd, F_GETFL)) == -1) {
+		perror("fcntl - F_GETFL");
+		return -1;
+	}
+
+	flags |= O_NONBLOCK;
+	if (fcntl(fd, F_SETFL, &flags) == -1) {
+		perror("fcntl - F_SETFL");
+		return -1;
+	}
+
+	return 0;
+}
+
+/*
+ * To prevent the signal race when receiving data from the socket. we decided
+ * to use pselect() to prevent it. and set the socket to NONBLOCK.
+ */
 static int icmp_create(int family)
 {
 	int sk = -1;
@@ -105,8 +147,14 @@ static int icmp_create(int family)
 	if ((sk = socket(family, SOCK_RAW, proto)) == -1)
 		goto out;
 
-out:
+	if (set_nonblock(sk) == -1)
+		goto out;
+
 	return sk;
+out:
+	if (sk >= 0)
+		close(sk);
+	return -1;
 }
 
 /*
@@ -146,19 +194,22 @@ static int traceroute_send(struct traceroute *tr)
 		goto out;
 
 	/* Save the current time, that data be send. */
-	if (gettimeofday(&tr->rtt, NULL) == -1)
+	if (gettimeofday(&tr->rtt, NULL) == -1) {
+		perror("getimeofday");
 		goto out;
+	}
 
 	/*
 	 * Just send a timeval structure by using UDP to peer host.
 	 * we don't check in the case of return value >= 0 but < PACKET_SZ.
 	 */
-	if (sendto(tr->sendsk, &tr->rtt, PACKET_SZ, 0,
-				(struct sockaddr *)&tr->addr,
-				tr->addrlen) != PACKET_SZ)
+	if ((tr->ret = sendto(tr->sendsk, &tr->rtt, PACKET_SZ, 0,
+			      (struct sockaddr *)&tr->addr,
+			      tr->addrlen)) != PACKET_SZ) {
+		perror("sendto");
 		goto out;
+	}
 
-	tr->ret = PACKET_SZ;
 out:
 	return tr->ret;
 }
@@ -201,7 +252,6 @@ static char *str_addr(struct sockaddr *sa)
 	case AF_INET6:
 		addr = &((struct sockaddr_in6 *)sa)->sin6_addr;
 		break;
-		break;
 	default:
 		errno = -EAFNOSUPPORT;
 		goto out;
@@ -235,11 +285,6 @@ out:
 	if (hostname)
 		free(hostname);
 	return NULL;
-}
-
-static void sigalrm_handler(int signo)
-{
-	gotalrm = 1;
 }
 
 static int address_check(struct traceroute *tr)
@@ -372,41 +417,61 @@ static long traceroute_getrtt(struct traceroute *tr)
 static int traceroute_recv(struct traceroute *tr)
 {
 	struct timeval now;
-
-	alarm(5);	/* Time wait for receipt */
+	fd_set rset;
+	sigset_t new, old;
 
 	tr->ret = -1;	/* validity_check() will set 'ret' field correctly. */
-	for ( ;; ) {
-		if (gotalrm) {
-			gotalrm = 0;
-			break;
-		}
-
-		tr->peerlen = sizeof(tr->peer);	/* Result-Value parameter */
-		tr->nread = recvfrom(tr->recvsk, tr->buf, sizeof(tr->buf), 0,
-				     (struct sockaddr *)&tr->peer,
-				     &tr->peerlen);
-
-		if (gettimeofday(&now, NULL) == -1)
-			break;
-		
-		/* If nread is 0, then indicates received zero length data. */
-		if (tr->nread < 0) {
-			if (errno == EINTR)
-				continue;
-			break;
-		}
-
-		/* 
-		 * if not -1 returned, then must be a Time exceeded or
-		 * Destination unreachable packet.
-		 */
-		if (tr->validity_check(tr) != -1) {
-			timersub(&now, &tr->rtt, &tr->rtt);
-			break;
-		}
+	
+	FD_ZERO(&rset);
+	FD_SET(tr->recvsk, &rset);
+	
+	if (sigprocmask(SIG_BLOCK, &new, &old) == -1) {
+		perror("sigprocmask");
+		goto out;
 	}
 
+	alarm(5);	/* Time wait for receipt */
+	for ( ;; ) {
+		if (pselect(tr->recvsk + 1, &rset, NULL, NULL,
+			    NULL, &old) == -1) {
+			if (errno == EINTR)
+				break;
+			perror("pselect");
+			goto out;
+		}
+
+		if (FD_ISSET(tr->recvsk, &rset)) {
+			/* Result-Value parameter */
+			tr->peerlen = sizeof(tr->peer);
+			tr->nread = recvfrom(tr->recvsk, tr->buf,
+					     sizeof(tr->buf), 0,
+				             (struct sockaddr *)&tr->peer,
+				             &tr->peerlen);
+			
+			if (gettimeofday(&now, NULL) == -1)
+				continue;
+
+			if (tr->nread == -1
+			    && errno != EWOULDBLOCK
+			    && errno != EAGAIN) {
+				perror("recvfrom");
+				continue;
+			}
+
+			/* 
+			 * Return -1 on not a valid packet, or
+			 * ICMP_TIME_EXCEEDED on TTL be zero. or
+			 * ICMP_PORT_UNREACH when probe have reached.
+			 */
+			if (tr->validity_check(tr) != -1) {
+				timersub(&now, &tr->rtt, &tr->rtt);
+				break;
+			}
+			
+		}
+
+	}
+out:
 	alarm(0);
 	return tr->ret;
 }
@@ -466,7 +531,7 @@ static int probe_launch(struct traceroute *tr)
 				printf(" * ms ");
 		}
 
-		if (tr->ret == ICMP_DEST_UNREACH)
+		if (tr->ret == ICMP_PORT_UNREACH)
 			done = 1;
 	}
 
@@ -488,17 +553,6 @@ static void traceroute_launch(struct traceroute *tr)
 		done = probe_launch(tr);
 		printf("\n");
 	}
-}
-
-static int sigalrm_handler_register(void)
-{
-	struct sigaction act;
-
-	act.sa_handler = sigalrm_handler;
-	sigemptyset(&act.sa_mask);
-	if (sigaction(SIGALRM, &act, NULL) == -1)
-		return -1;
-	return 0;
 }
 
 /*
@@ -561,9 +615,6 @@ static int traceroute_new_impl(struct traceroute *tr)
 	if ((tr->recvsk = icmp_create(ai->ai_family)) == -1)
 		goto out;
 
-	if (sigalrm_handler_register() == -1)
-		goto out;
-
 	ret = 0;
 out:
 	if (res)
@@ -576,6 +627,8 @@ static void traceroute_delete(struct traceroute *tr)
 	if (tr) {
 		free(tr->hostname);
 		free(tr->canonname);
+		close(tr->sendsk);
+		close(tr->recvsk);
 	}
 
 	free(tr);
